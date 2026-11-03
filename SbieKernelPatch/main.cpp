@@ -2,15 +2,17 @@
 #include "args.hxx"             //命令行解析
 
 #include "Utils.h"              //工具函数
+#include "DriverTypes.h"        //NtQuerySystemInformation相关类型
 #include "SigUtil.h"            //签名相关函数
 #include "SbieUtil.h"           //Sbie相关函数
 #include "DriverUtil.h"         //驱动操作相关函数
-#include "DriverInterface.h"    //echo驱动接口
+#include "DriverInterface.h"    //TEACCESS驱动接口
 
 #pragma comment(lib, "ntdll.lib")
 
 #define INSTANCE_NAME "SbieKernelPatch"
-#define ECHO_DRV_NAME "EchoDrv"
+#define TEACCESS_DRV_NAME "TEACCESS"
+#define TEACCESS_SYS_FILE "TBT_Force_Power_Control_Access64.sys"
 
 #define CERTIFICATE_FILE "Certificate.dat"
 #define PUBLIC_KEY_FILE "skp_public_key.blob"
@@ -22,7 +24,7 @@
 #define SANDMAN_SIG "SandMan.exe.sig"
 #define SANDMAN_SIG_BAK "SandMan.exe.sig.bak"
 
-#define SKP_VERSION "1.0.0"
+#define SKP_VERSION "2.1.0"
 #define SKP_VERSION_NAME "SbieKernelPatch v" SKP_VERSION
 
 //HWID
@@ -156,7 +158,7 @@ int main(int argc, char* argv[])
     args::HelpFlag help(parser, "help", "Display this help menu", { 'h', "help" });
     args::Flag new_key(parser, "new_key", "Use new ECDSA key", { 'n', "new" });
     args::ValueFlag<std::string> cert_file(parser, "cert_file", "Replace the signature field in the specified Cert file", { 'c', "cert"});
-    args::Flag keep_echodrv(parser, "keep_ehcodrv", "Keep Echo drv running after patch", { 'k', "keep" });
+    args::Flag keep_echodrv(parser, "keep_ehcodrv", "Keep TEACCESS drv running after patch", { 'k', "keep" });
     args::Flag set_autorun(parser, "set_autorun", "Set autorun", { 'a', "autor" });
     args::Flag unset_autorun(parser, "unset_autorun", "Unset autorun", { 'u', "uautor" });
     args::Flag readonly_key(parser, "readonly_key", "Only read KphpTrustedPublicKey", {'r', "read"});
@@ -274,39 +276,47 @@ int main(int argc, char* argv[])
         std::cout << "[!] Error: OpenProcessToken Failed!" << std::endl;
     }
     
-    // 安装/启动EchoDrv驱动
-    std::string cur_path = Utils::GetCurrentProcessDir();
-    std::cout << "[=] Begin Reg and Start \'echo.sys\'(EchoDrv)..." << std::endl;
+    // 声明须位于所有 goto CLEAN 之前, 否则跳过带初始化的声明 (E0546)
+    NTSTATUS status; // Status variable
+    PRTL_PROCESS_MODULES ModuleInfo = NULL; // Store modules
+    uintptr_t SbieDrvBaseAddress = NULL;   // SbieDrv.sys base address
+    uint64_t KphpTrustedPublicKeyOffsetSigned = 0;
+    uint64_t KphpTrustedPublicKeyOffset = 0;
+    uint64_t KphpTrustedPublicKeyAddress = 0;
+    uint8_t KphpTrustedPublicKey[72] = { 0 };
+    BOOL bResult = FALSE;
 
-    std::string echodrv_path = cur_path + "\\echo.sys";
-    bool result = DriverUtil::InstallDriver(ECHO_DRV_NAME, echodrv_path);
+    // 安装/启动 TEACCESS 驱动
+    std::string cur_path = Utils::GetCurrentProcessDir();
+    std::cout << "[=] Begin Reg and Start \'" << TEACCESS_SYS_FILE << "\'..." << std::endl;
+
+    std::string teaccess_path = cur_path + "\\" + TEACCESS_SYS_FILE;
+    bool result = DriverUtil::InstallDriver(TEACCESS_DRV_NAME, teaccess_path);
     if (!result) {
-        std::cout << "[!] Error: can't install echo driver!" << std::endl;
+        std::cout << "[!] Error: can't install TEACCESS driver!" << std::endl;
         return -1;
     }
 
-    result = DriverUtil::StartDriver(ECHO_DRV_NAME);
+    result = DriverUtil::StartDriver(TEACCESS_DRV_NAME);
     if (!result) {
-        std::cout << "[!] Error: can't start echo driver!" << std::endl;
+        std::cout << "[!] Error: can't start TEACCESS driver!" << std::endl;
         return -1;
     }
 
     // 获取SbieDrv.sys的基址
     std::cout << "[=] Begin search \'SbieDrv.sys\'..." << std::endl;
     DriverInterface Driver; // Instantiate our driver
-    HANDLE processHandle = Driver.get_handle_for_pid(GetCurrentProcessId()); // Fetch a HANDLE for our own program.
-
-    NTSTATUS status; // Status variable
-    PRTL_PROCESS_MODULES ModuleInfo; // Store modules
-    uintptr_t SbieDrvBaseAddress = NULL;   // SbieDrv.sys base address
+    if (!Driver.IsOpen()) {
+        std::cout << "[!] Error: can't open \\\\.\\TEACCESS!" << std::endl;
+        goto CLEAN;
+    }
 
     // Leak SbieDrv.sys base address using NtQuerySystemInformation
     ModuleInfo = (PRTL_PROCESS_MODULES)VirtualAlloc(NULL, 1024 * 1024, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
     if (!ModuleInfo) {
         printf("[!] Error allocating module memory! Error Code: %lu", GetLastError());
-        Driver.Shutdown();
-        return -1;
+        goto CLEAN;
     }
 
     // Call NtQuerySystemInformation and ask for the System module list.
@@ -316,8 +326,7 @@ int main(int argc, char* argv[])
         printf("\n[!] Error: Unable to query module list (%#x)\n", status);
 
         VirtualFree(ModuleInfo, 0, MEM_RELEASE);
-        Driver.Shutdown();
-        return -1;
+        goto CLEAN;
     }
 
     // Iterate through module list till we find the Kernel base address.
@@ -338,26 +347,25 @@ int main(int argc, char* argv[])
 
     if (SbieDrvBaseAddress == 0) {
         std::cout << "[!] Error: Can't find SbieDrv.sys base address!" << std::endl;
-        return -1;
+        goto CLEAN;
     }
 
     std::cout << "[+] SbieDrv.sys base address: 0x" << std::hex << SbieDrvBaseAddress << std::dec << std::endl;
     
     // 读取KphpTrustedPublicKey公钥, 从文件中特征码匹配获取变量偏移
     std::cout << "[=] Begin get KphpTrustedPublicKey offset from file..." << std::endl;
-    uint64_t KphpTrustedPublicKeyOffsetSigned = SbieUtil::GetKphVerifySignatureOffset(SBIEDRV_NAME);
+    KphpTrustedPublicKeyOffsetSigned = SbieUtil::GetKphVerifySignatureOffset(SBIEDRV_NAME);
     if (KphpTrustedPublicKeyOffsetSigned == 0) {
         std::cout << "[!] Error: GetSymbolOffset KphpTrustedPublicKeyOffset from " << SBIEPDB_NAME << " Failed!" << std::endl;
-        return -1;
+        goto CLEAN;
     }
-    uint64_t KphpTrustedPublicKeyOffset = static_cast<uint64_t>(KphpTrustedPublicKeyOffsetSigned),
+    KphpTrustedPublicKeyOffset = static_cast<uint64_t>(KphpTrustedPublicKeyOffsetSigned),
         KphpTrustedPublicKeyAddress = SbieDrvBaseAddress + KphpTrustedPublicKeyOffset;
     std::cout << "[+] KphpTrustedPublicKey offset: 0x" << std::hex << KphpTrustedPublicKeyOffset << std::dec << std::endl;
-    
-    uint8_t KphpTrustedPublicKey[72] = { 0 };
-    BOOL bResult = Driver.read_memory_raw((void*)KphpTrustedPublicKeyAddress, KphpTrustedPublicKey, 72, processHandle);
+
+    bResult = Driver.ReadKernel(KphpTrustedPublicKeyAddress, KphpTrustedPublicKey, 72);
     if (!bResult) {
-        std::cout << "[!] Error: Driver.read_memory_raw Failed!" << std::endl;
+        std::cout << "[!] Error: Driver.ReadKernel Failed!" << std::endl;
         goto CLEAN;
     }
 
@@ -370,10 +378,14 @@ int main(int argc, char* argv[])
     //  如果没有只读取public key参数, 进行Patch
     if (!readonly_key) {
         std::cout << "[=] Begin Patch KphpTrustedPublicKey to self own key..." << std::endl;
-        bResult = Driver.read_memory_raw((void*)(default_publick_key.data()), (void*)KphpTrustedPublicKeyAddress, 72, processHandle);
+        // 物理写入绕过 .rdata 只读 PTE, 写后读回验证
+        bResult = Driver.WriteKernel(KphpTrustedPublicKeyAddress, default_publick_key.data(), 72);
+        if (bResult) {
+            bResult = Driver.VerifyKernel(KphpTrustedPublicKeyAddress, default_publick_key.data(), 72);
+        }
         if (bResult) {
             std::cout << "[+] Patch SbieDrv.sys Public Key Over!" << std::endl;
-            bResult = Driver.read_memory_raw((void*)KphpTrustedPublicKeyAddress, KphpTrustedPublicKey, 72, processHandle);
+            bResult = Driver.ReadKernel(KphpTrustedPublicKeyAddress, KphpTrustedPublicKey, 72);
             std::cout << "[+] New KphpTrustedPublicKey: [ " << std::endl;
             for (size_t i = 0; i < 72; i++)
             {
@@ -406,17 +418,18 @@ int main(int argc, char* argv[])
     }
 
 CLEAN:
-    //运行完卸载EchoDrv驱动
-    if (!keep_echodrv) { 
-        std::cout << "[=] Begin Stop and Delete \'EchoDrv\'..." << std::endl;
-        bool result = DriverUtil::StopDriver(ECHO_DRV_NAME);
+    Driver.Shutdown();
+    //运行完卸载TEACCESS驱动
+    if (!keep_echodrv) {
+        std::cout << "[=] Begin Stop and Delete \'" << TEACCESS_DRV_NAME << "\'..." << std::endl;
+        bool result = DriverUtil::StopDriver(TEACCESS_DRV_NAME);
         if (result) {
-            result = DriverUtil::DeleteDriver(ECHO_DRV_NAME);
+            result = DriverUtil::DeleteDriver(TEACCESS_DRV_NAME);
             if (!result)
-                std::cout << "[!] Error: can't delete echo driver!" << std::endl;
+                std::cout << "[!] Error: can't delete TEACCESS driver!" << std::endl;
         }
         else {
-            std::cout << "[!] Error: can't stop echo driver!" << std::endl;
+            std::cout << "[!] Error: can't stop TEACCESS driver!" << std::endl;
         }
     }
 
