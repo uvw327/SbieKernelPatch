@@ -34,21 +34,22 @@ jobs:
           Copy-Item README.md dist\README.md -Force
           Copy-Item LICENSE dist\LICENSE -Force
 
-          @"
-SbieKernelPatch - Release x64 build
-====================================
-
-This package contains the user-mode tool only.
-
-The vulnerable kernel driver used by the tool
-(TBT_Force_Power_Control_Access64.sys) is NOT included in this repository
-and is not part of this archive. Place it next to SbieKernelPatch.exe
-before running the tool.
-
-Run as Administrator, from the Sandboxie-Plus installation directory,
-with the Microsoft vulnerable driver blocklist disabled.
-Use -h for command line options.
-"@ | Out-File -FilePath dist\BUILD-NOTES.txt -Encoding utf8
+          $notes = @(
+            "SbieKernelPatch - Release x64 build",
+            "====================================",
+            "",
+            "This package contains the user-mode tool only.",
+            "",
+            "The vulnerable kernel driver used by the tool",
+            "(TBT_Force_Power_Control_Access64.sys) is NOT included in this repository",
+            "and is not part of this archive. Place it next to SbieKernelPatch.exe",
+            "before running the tool.",
+            "",
+            "Run as Administrator, from the Sandboxie-Plus installation directory,",
+            "with the Microsoft vulnerable driver blocklist disabled.",
+            "Use -h for command line options."
+          )
+          $notes | Out-File -FilePath dist\BUILD-NOTES.txt -Encoding utf8
 
       - name: Package
         shell: pwsh
