@@ -319,6 +319,7 @@ int main(int argc, char* argv[])
     uint64_t KphpTrustedPublicKeyAddress = 0;
     uint8_t KphpTrustedPublicKey[72] = { 0 };
     BOOL bResult = FALSE;
+    bool foundSbieDrv = false;
 
     // 安装/启动 TEACCESS 驱动
     std::string cur_path = Utils::GetCurrentProcessDir();
@@ -364,7 +365,6 @@ int main(int argc, char* argv[])
     }
 
     // Iterate through module list till we find the Kernel base address.
-    bool foundSbieDrv = false;
     for (int i = 0; i < ModuleInfo->NumberOfModules; i++) {
 #ifdef _DEBUG
         std::cout << "[D] ModuleName: " << ModuleInfo->Modules[i].FullPathName + ModuleInfo->Modules[i].OffsetToFileName << std::endl;
