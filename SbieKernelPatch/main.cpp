@@ -395,7 +395,6 @@ int main(int argc, char* argv[])
             std::cout << "[!] SbieDrv.sys is not in the module list; is the Sandboxie driver running?" << std::endl;
         goto CLEAN;
     }
-    }
 
     std::cout << "[+] SbieDrv.sys base address: 0x" << std::hex << SbieDrvBaseAddress << std::dec << std::endl;
     
