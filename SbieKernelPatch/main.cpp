@@ -1,4 +1,7 @@
 ﻿#include <fstream>
+#include <psapi.h>
+#include <vector>
+#include <string.h>
 #include "args.hxx"             //命令行解析
 
 #include "Utils.h"              //工具函数
@@ -9,6 +12,7 @@
 #include "DriverInterface.h"    //TEACCESS驱动接口
 
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "psapi.lib")
 
 #define INSTANCE_NAME "SbieKernelPatch"
 #define TEACCESS_DRV_NAME "TEACCESS"
@@ -23,6 +27,27 @@
 #define SANDMAN_EXE "SandMan.exe"
 #define SANDMAN_SIG "SandMan.exe.sig"
 #define SANDMAN_SIG_BAK "SandMan.exe.sig.bak"
+
+// Fallback for Win11 builds where NtQuerySystemInformation(SystemModuleInformation)
+// zeroes ImageBase: EnumDeviceDrivers still returns the loaded module bases.
+static ULONG_PTR FindDriverBaseByEnum(const char* targetName)
+{
+    DWORD needed = 0;
+    if (!EnumDeviceDrivers(NULL, 0, &needed) || needed == 0)
+        return 0;
+
+    std::vector<LPVOID> bases(needed / sizeof(LPVOID));
+    if (!EnumDeviceDrivers(bases.data(), needed, &needed))
+        return 0;
+
+    for (LPVOID base : bases) {
+        char name[MAX_PATH] = { 0 };
+        if (GetDeviceDriverBaseNameA(base, name, MAX_PATH) &&
+            _stricmp(name, targetName) == 0)
+            return (ULONG_PTR)base;
+    }
+    return 0;
+}
 
 #define SKP_VERSION "2.1.0"
 #define SKP_VERSION_NAME "SbieKernelPatch v" SKP_VERSION
@@ -243,8 +268,8 @@ int main(int argc, char* argv[])
         return 0;
     }
     
-    // 如果不存在Certificate.dat, 则生成一个默认的, 或者有-n参数也要重新生成
-    if (!Utils::FileExists(CERTIFICATE_FILE) || new_key) {
+    // 如果不存在Certificate.dat, 则生成一个默认的, 或者有-n参数也要重新生成; -r 只读模式不写证书
+    if (!readonly_key && (!Utils::FileExists(CERTIFICATE_FILE) || new_key)) {
         std::cout << "[=] Begin genrate and write \'Certificate.dat\'..." << std::endl;
         g_hwid = SbieUtil::InitFwUuid();
         if (g_hwid.empty()) {
@@ -267,8 +292,16 @@ int main(int argc, char* argv[])
         priv.PrivilegeCount = 1;
         priv.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-        if (LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &priv.Privileges[0].Luid))
-            AdjustTokenPrivileges(hToken, FALSE, &priv, 0, NULL, NULL);
+        if (LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &priv.Privileges[0].Luid)) {
+            if (AdjustTokenPrivileges(hToken, FALSE, &priv, 0, NULL, NULL)) {
+                if (GetLastError() == ERROR_NOT_ALL_ASSIGNED)
+                    std::cout << "[!] Warning: SeDebugPrivilege not assigned; address leak may occur" << std::endl;
+                else
+                    std::cout << "[+] SeDebugPrivilege enabled" << std::endl;
+            } else {
+                std::cout << "[!] Warning: AdjustTokenPrivileges failed: " << GetLastError() << std::endl;
+            }
+        }
 
         CloseHandle(hToken);
     }
@@ -330,14 +363,17 @@ int main(int argc, char* argv[])
     }
 
     // Iterate through module list till we find the Kernel base address.
-    // We do this by iterating through the list till we find a module named "ntoskrnl.exe" - this is the Kernel.
+    bool foundSbieDrv = false;
     for (int i = 0; i < ModuleInfo->NumberOfModules; i++) {
 #ifdef _DEBUG
         std::cout << "[D] ModuleName: " << ModuleInfo->Modules[i].FullPathName + ModuleInfo->Modules[i].OffsetToFileName << std::endl;
 #endif // 输出模块信息
-        if (!strcmp((const char*)ModuleInfo->Modules[i].FullPathName + ModuleInfo->Modules[i].OffsetToFileName,
-            "SbieDrv.sys")) {
+        const char* moduleName = (const char*)ModuleInfo->Modules[i].FullPathName + ModuleInfo->Modules[i].OffsetToFileName;
+        if (_stricmp(moduleName, "SbieDrv.sys") == 0) {
+            foundSbieDrv = true;
             SbieDrvBaseAddress = (uintptr_t)ModuleInfo->Modules[i].ImageBase;
+            if (SbieDrvBaseAddress == 0)
+                std::cout << "[!] SbieDrv.sys found but ImageBase is zero (address leak)" << std::endl;
             break;
         }
     }
@@ -346,8 +382,18 @@ int main(int argc, char* argv[])
     VirtualFree(ModuleInfo, 0, MEM_RELEASE);
 
     if (SbieDrvBaseAddress == 0) {
+        std::cout << "[=] Falling back to EnumDeviceDrivers..." << std::endl;
+        SbieDrvBaseAddress = FindDriverBaseByEnum("SbieDrv.sys");
+        if (SbieDrvBaseAddress)
+            std::cout << "[+] Found SbieDrv.sys via EnumDeviceDrivers: 0x" << std::hex << SbieDrvBaseAddress << std::dec << std::endl;
+    }
+
+    if (SbieDrvBaseAddress == 0) {
         std::cout << "[!] Error: Can't find SbieDrv.sys base address!" << std::endl;
+        if (!foundSbieDrv)
+            std::cout << "[!] SbieDrv.sys is not in the module list; is the Sandboxie driver running?" << std::endl;
         goto CLEAN;
+    }
     }
 
     std::cout << "[+] SbieDrv.sys base address: 0x" << std::hex << SbieDrvBaseAddress << std::dec << std::endl;
